@@ -1,21 +1,18 @@
-import sys
-sys.path.append('core')
-
-from PIL import Image
 import argparse
 import os
-import time
+
 import numpy as np
 import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
+from tqdm.autonotebook import tqdm
 
-import datasets
-from utils import flow_viz
-from utils import frame_utils
+import ants.y2020.raft.RAFT.core.datasets as datasets
+from ants.y2020.raft.RAFT.core.raft import RAFT
+from ants.y2020.raft.RAFT.core.utils import frame_utils
+from ants.y2020.raft.RAFT.core.utils.utils import InputPadder, forward_interpolate
+from aria.bolts.consts import PathUtils
+from aria.providers.critic.epe import EPE
 
-from raft import RAFT
-from utils.utils import InputPadder, forward_interpolate
+SINTEL_ROOT = PathUtils.dataset_path('Sintel')
 
 
 @torch.no_grad()
@@ -23,14 +20,14 @@ def create_sintel_submission(model, iters=32, warm_start=False, output_path='sin
     """ Create submission for the Sintel leaderboard """
     model.eval()
     for dstype in ['clean', 'final']:
-        test_dataset = datasets.MpiSintel(split='test', aug_params=None, dstype=dstype)
-        
+        test_dataset = datasets.MpiSintel(split='test', root=SINTEL_ROOT, aug_params=None, dstype=dstype)
+
         flow_prev, sequence_prev = None, None
         for test_id in range(len(test_dataset)):
             image1, image2, (sequence, frame) = test_dataset[test_id]
             if sequence != sequence_prev:
                 flow_prev = None
-            
+
             padder = InputPadder(image1.shape)
             image1, image2 = padder.pad(image1[None].cuda(), image2[None].cuda())
 
@@ -39,9 +36,9 @@ def create_sintel_submission(model, iters=32, warm_start=False, output_path='sin
 
             if warm_start:
                 flow_prev = forward_interpolate(flow_low[0])[None].cuda()
-            
+
             output_dir = os.path.join(output_path, dstype, sequence)
-            output_file = os.path.join(output_dir, 'frame%04d.flo' % (frame+1))
+            output_file = os.path.join(output_dir, 'frame%04d.flo' % (frame + 1))
 
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
@@ -60,7 +57,7 @@ def create_kitti_submission(model, iters=24, output_path='kitti_submission'):
         os.makedirs(output_path)
 
     for test_id in range(len(test_dataset)):
-        image1, image2, (frame_id, ) = test_dataset[test_id]
+        image1, image2, (frame_id,) = test_dataset[test_id]
         padder = InputPadder(image1.shape, mode='kitti')
         image1, image2 = padder.pad(image1[None].cuda(), image2[None].cuda())
 
@@ -84,7 +81,7 @@ def validate_chairs(model, iters=24):
         image2 = image2[None].cuda()
 
         _, flow_pr = model(image1, image2, iters=iters, test_mode=True)
-        epe = torch.sum((flow_pr[0].cpu() - flow_gt)**2, dim=0).sqrt()
+        epe = torch.sum((flow_pr[0].cpu() - flow_gt) ** 2, dim=0).sqrt()
         epe_list.append(epe.view(-1).numpy())
 
     epe = np.mean(np.concatenate(epe_list))
@@ -92,16 +89,18 @@ def validate_chairs(model, iters=24):
     return {'chairs': epe}
 
 
+# noinspection PyStringFormat
 @torch.no_grad()
 def validate_sintel(model, iters=32):
-    """ Peform validation using the Sintel (train) split """
+    """ Perform validation using the Sintel (train) split """
     model.eval()
     results = {}
     for dstype in ['clean', 'final']:
-        val_dataset = datasets.MpiSintel(split='training', dstype=dstype)
+        val_dataset = datasets.MpiSintel(split='training', root=SINTEL_ROOT, dstype=dstype)
         epe_list = []
 
-        for val_id in range(len(val_dataset)):
+        pbar = tqdm(range(len(val_dataset)), desc='Validating Sintel %s' % dstype)
+        for val_id in pbar:
             image1, image2, flow_gt, _ = val_dataset[val_id]
             image1 = image1[None].cuda()
             image2 = image2[None].cuda()
@@ -112,14 +111,17 @@ def validate_sintel(model, iters=32):
             flow_low, flow_pr = model(image1, image2, iters=iters, test_mode=True)
             flow = padder.unpad(flow_pr[0]).cpu()
 
-            epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
+            epe = torch.sum((flow - flow_gt) ** 2, dim=0).sqrt()
             epe_list.append(epe.view(-1).numpy())
+            print(epe_list[-1].mean(), EPE(mean=True)(flow, flow_gt).item())
+
+            pbar.set_description('Validating Sintel %s: EPE=%f' % (dstype, np.concatenate(epe_list).mean()))
 
         epe_all = np.concatenate(epe_list)
         epe = np.mean(epe_all)
-        px1 = np.mean(epe_all<1)
-        px3 = np.mean(epe_all<3)
-        px5 = np.mean(epe_all<5)
+        px1 = np.mean(epe_all < 1)
+        px3 = np.mean(epe_all < 3)
+        px5 = np.mean(epe_all < 5)
 
         print("Validation (%s) EPE: %f, 1px: %f, 3px: %f, 5px: %f" % (dstype, epe, px1, px3, px5))
         results[dstype] = np.mean(epe_list)
@@ -127,9 +129,10 @@ def validate_sintel(model, iters=32):
     return results
 
 
+# noinspection PyStringFormat
 @torch.no_grad()
 def validate_kitti(model, iters=24):
-    """ Peform validation using the KITTI-2015 (train) split """
+    """ Perform validation using the KITTI-2015 (train) split """
     model.eval()
     val_dataset = datasets.KITTI(split='training')
 
@@ -145,14 +148,14 @@ def validate_kitti(model, iters=24):
         flow_low, flow_pr = model(image1, image2, iters=iters, test_mode=True)
         flow = padder.unpad(flow_pr[0]).cpu()
 
-        epe = torch.sum((flow - flow_gt)**2, dim=0).sqrt()
-        mag = torch.sum(flow_gt**2, dim=0).sqrt()
+        epe = torch.sum((flow - flow_gt) ** 2, dim=0).sqrt()
+        mag = torch.sum(flow_gt ** 2, dim=0).sqrt()
 
         epe = epe.view(-1)
         mag = mag.view(-1)
         val = valid_gt.view(-1) >= 0.5
 
-        out = ((epe > 3.0) & ((epe/mag) > 0.05)).float()
+        out = ((epe > 3.0) & ((epe / mag) > 0.05)).float()
         epe_list.append(epe[val].mean().item())
         out_list.append(out[val].cpu().numpy())
 
@@ -172,11 +175,12 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', help="dataset for evaluation")
     parser.add_argument('--small', action='store_true', help='use small model')
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
-    parser.add_argument('--alternate_corr', action='store_true', help='use efficent correlation implementation')
+    parser.add_argument('--alternate_corr', action='store_true', help='use efficient correlation implementation')
     args = parser.parse_args()
 
+    # noinspection PyTypeChecker
     model = torch.nn.DataParallel(RAFT(args))
-    model.load_state_dict(torch.load(args.model))
+    model.load_state_dict(torch.load(PathUtils.checkpoints_path() / args.model))
 
     model.cuda()
     model.eval()
@@ -193,5 +197,3 @@ if __name__ == '__main__':
 
         elif args.dataset == 'kitti':
             validate_kitti(model.module)
-
-
